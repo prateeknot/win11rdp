@@ -1,5 +1,4 @@
 # language: YAML, file: .github/workflows/main.yml, target: GitHub Actions windows-latest
-# Master workflow — 10 features + self-destruct cleanup
 name: RDP
 
 on:
@@ -181,18 +180,18 @@ jobs:
           RDP_PASSWORD: ${{ inputs.password }}
         run: |
           $password = if ($env:RDP_PASSWORD) { $env:RDP_PASSWORD } else { "Rdp@12345" }
-          $summary = @"
-## RDP Connection Info
-
-- **Tailscale IP:** $env:TAILSCALE_IP
-- **Hostname:** $env:TS_HOSTNAME
-- **Username:** RDP
-- **Password:** $password
-- **Port:** 3389
-- **Security:** NLA off, SecurityLayer=Negotiate (TLS when client supports)
-
-"@
-          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          $lines = @(
+            '## RDP Connection Info',
+            '',
+            ('- **Tailscale IP:** ' + $env:TAILSCALE_IP),
+            ('- **Hostname:** ' + $env:TS_HOSTNAME),
+            '- **Username:** RDP',
+            ('- **Password:** ' + $password),
+            '- **Port:** 3389',
+            '- **Security:** NLA off, SecurityLayer=Negotiate (TLS when client supports)',
+            ''
+          )
+          $lines -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
           & "$env:ProgramFiles\Tailscale\tailscale.exe" status | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
 
       - name: Maintain Connection
