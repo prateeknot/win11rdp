@@ -1,92 +1,263 @@
-name: RDP
+# Static-reviewed replacement; NOT executed on a Windows runner.
+# Intended for authorized, temporary debugging, not persistent hosting.
+# Required secrets: RDP_PASSWORD and TAILSCALE_AUTH_KEY.
+# Use a short-lived, preauthorized ephemeral Tailscale key.
+# Restrict tailnet policy to the intended client -> runner TCP/3389.
+name: Temporary RDP Debug Session
 
 on:
   workflow_dispatch:
+    inputs:
+      client_ip:
+        description: 'Your connecting device Tailscale IPv4 (100.64.0.0/10)'
+        required: true
+        type: string
+      session_minutes:
+        description: 'Session duration, integer 1-300 minutes'
+        required: true
+        default: '60'
+        type: string
+
+permissions: {}
 
 jobs:
   secure-rdp:
-    runs-on: windows-latest
-    timeout-minutes: 3600
+    runs-on: windows-2022
+    timeout-minutes: 330
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CLIENT_IP: ${{ inputs.client_ip }}
+      SESSION_MINUTES: ${{ inputs.session_minutes }}
+      # Preserves the supplied version, NOT a claim it is current/security-approved.
+      # Review supported releases before use and update this deliberately.
+      TAILSCALE_VERSION: '1.82.0'
 
     steps:
-      - name: Configure Core RDP Settings
+      - name: Validate inputs and runner before changing configuration
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
-          Restart-Service -Name TermService -Force
+          $ErrorActionPreference = 'Stop'
+          $minutes = 0
+          if (-not [int]::TryParse($env:SESSION_MINUTES, [ref]$minutes) -or
+              $minutes -lt 1 -or $minutes -gt 300) {
+            throw 'session_minutes must be an integer from 1 to 300.'
+          }
+          if ($env:CLIENT_IP -notmatch '^100\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$') {
+            throw 'client_ip must be a canonical Tailscale IPv4 address.'
+          }
+          $parts = $env:CLIENT_IP.Split('.')
+          $octets = @($parts | ForEach-Object { [int]$_ })
+          if ($octets[1] -lt 64 -or $octets[1] -gt 127 -or
+              $octets[2] -gt 255 -or $octets[3] -gt 255 -or
+              (($octets -join '.') -cne $env:CLIENT_IP)) {
+            throw 'client_ip must be a canonical address in 100.64.0.0/10.'
+          }
+          $p = $env:RDP_PASSWORD
+          if ([string]::IsNullOrWhiteSpace($p) -or $p.Length -lt 16 -or
+              $p -cnotmatch '[A-Z]' -or $p -cnotmatch '[a-z]' -or
+              $p -notmatch '[0-9]' -or $p -notmatch '[^a-zA-Z0-9]' -or
+              $p -match '(?i)rdp') {
+            throw 'Set RDP_PASSWORD: 16+ characters, upper/lower/digit/symbol; exclude the username RDP.'
+          }
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTH_KEY)) {
+            throw 'Set the TAILSCALE_AUTH_KEY secret.'
+          }
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw 'Runner requires an elevated PowerShell session.'
+          }
+          Get-Service TermService, MpsSvc -ErrorAction Stop | Out-Null
+          if (Get-LocalUser -Name RDP -ErrorAction SilentlyContinue) {
+            throw 'RDP account already exists; refusing to overwrite it.'
+          }
+          if (@(Get-NetFirewallProfile | Where-Object { -not $_.Enabled }).Count) {
+            throw 'All Windows firewall profiles must already be enabled.'
+          }
+          Write-Host 'Preflight passed; no passwords are printed.'
 
-      - name: Create RDP User with Simple Password
+      - name: Install signed Tailscale package with bounded retries
         run: |
-          # ---- Password policy disable karein ----
-          # Yeh command "Password must meet complexity requirements" ko disable karta hai
-          secedit /export /cfg "$env:TEMP\secpol.cfg"
-          (Get-Content "$env:TEMP\secpol.cfg") -replace 'PasswordComplexity = 1', 'PasswordComplexity = 0' | Set-Content "$env:TEMP\secpol.cfg"
-          secedit /configure /db secedit.sdb /cfg "$env:TEMP\secpol.cfg" /areas SECURITYPOLICY
-          Remove-Item "$env:TEMP\secpol.cfg" -Force
-
-          # ---- Ab simple password se user banayein ----
-          $password = "Rdp@12345"   # <-- Yahan koi bhi simple password daal sakte ho
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
-              exit 1
+          $ErrorActionPreference = 'Stop'
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-$env:TAILSCALE_VERSION-amd64.msi"
+          $msi = Join-Path $env:RUNNER_TEMP 'tailscale.msi'
+          try {
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+              try {
+                Invoke-WebRequest -Uri $url -OutFile $msi -TimeoutSec 120
+                break
+              } catch {
+                if ($attempt -eq 3) { throw }
+                Start-Sleep -Seconds (5 * $attempt)
+              }
+            }
+            $sig = Get-AuthenticodeSignature -FilePath $msi
+            if ($sig.Status -ne 'Valid' -or
+                $sig.SignerCertificate.Subject -notmatch '(?i)\bTailscale\b') {
+              throw 'Installer signature or publisher validation failed.'
+            }
+            $installer = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait -PassThru
+            if ($installer.ExitCode -ne 0) {
+              throw "MSI exit code $($installer.ExitCode); reboot-required installs are not accepted."
+            }
+            $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+            if (-not (Test-Path $ts)) { throw 'Tailscale executable missing.' }
+            Start-Service Tailscale
+            (Get-Service Tailscale).WaitForStatus('Running', [TimeSpan]::FromSeconds(30))
+          } finally {
+            Remove-Item $msi -Force -ErrorAction SilentlyContinue
           }
 
-      - name: Install Tailscale
+      - name: Connect to Tailscale and validate assigned address
+        env:
+          TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          $ErrorActionPreference = 'Stop'
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $ts up "--auth-key=$env:TS_AUTH_KEY" "--hostname=gh-rdp-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT" --accept-routes=false --accept-dns=false --timeout=90s
+          if ($LASTEXITCODE -ne 0) { throw 'Tailscale login failed.' }
+          $ip = $null
+          for ($i = 0; $i -lt 12; $i++) {
+            $raw = & $ts status --json
+            $statusExit = $LASTEXITCODE
+            if ($statusExit -eq 0) {
+              $status = ($raw -join "`n") | ConvertFrom-Json
+              if ($status.BackendState -eq 'Running') {
+                $ip = @($status.TailscaleIPs | Where-Object { $_ -match '^100\.' }) | Select-Object -First 1
+                if ($ip) { break }
+              }
+            }
+            Start-Sleep -Seconds 5
+          }
+          if (-not $ip) { throw 'No running Tailscale IPv4 connection.' }
+          if ($ip -eq $env:CLIENT_IP) { throw 'client_ip must be your device, not this runner.' }
+          "TAILSCALE_IP=$ip" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Establish Tailscale Connection
+      - name: Enable NLA and TLS with client-scoped firewall access
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
-          }
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
-          }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          $ErrorActionPreference = 'Stop'
+          # Disposable hosted runner ONLY: do not use this on a shared/self-hosted machine.
+          $terminal = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
+          $listener = "$terminal\WinStations\RDP-Tcp"
+          # Mark cleanup responsibility before modifying RDP configuration.
+          'RDP_CONFIG_STARTED=true' | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Set-ItemProperty $terminal -Name fDenyTSConnections -Value 1
+          Set-ItemProperty $listener -Name UserAuthentication -Value 1
+          Set-ItemProperty $listener -Name SecurityLayer -Value 2
+          Set-ItemProperty $listener -Name MinEncryptionLevel -Value 3
+          $password = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          New-LocalUser -Name RDP -Password $password -AccountExpires ((Get-Date).AddMinutes([int]$env:SESSION_MINUTES + 15)) | Out-Null
+          'RDP_USER_CREATED=true' | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          $group = Get-LocalGroup -SID 'S-1-5-32-555'
+          Add-LocalGroupMember -Group $group.Name -Member RDP
+          # Disable existing explicit TCP/3389 allow rules; no blanket firewall disable.
+          Get-NetFirewallRule -Direction Inbound -Enabled True -Action Allow |
+            ForEach-Object {
+              $rule = $_
+              $filters = @($rule | Get-NetFirewallPortFilter)
+              if ($filters | Where-Object { $_.Protocol -in @('TCP', '6') -and '3389' -in @($_.LocalPort) }) {
+                $rule | Disable-NetFirewallRule | Out-Null
+              }
+            }
+          Get-NetFirewallRule -Name 'GH-RDP-Client' -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule
+          New-NetFirewallRule -Name 'GH-RDP-Client' -DisplayName 'GitHub temporary RDP client' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -LocalAddress $env:TAILSCALE_IP -RemoteAddress $env:CLIENT_IP -Profile Any | Out-Null
+          Set-ItemProperty $terminal -Name fDenyTSConnections -Value 0
+          Restart-Service TermService -Force
+          (Get-Service TermService).WaitForStatus('Running', [TimeSpan]::FromSeconds(30))
 
-      - name: Verify RDP Accessibility
+      - name: Check security invariants and local listener
         run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
+          $ErrorActionPreference = 'Stop'
+          $listener = Get-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+          if ($listener.UserAuthentication -ne 1 -or $listener.SecurityLayer -ne 2) {
+            throw 'Required NLA/TLS settings are not active.'
           }
-          Write-Host "TCP connectivity successful!"
+          $user = Get-LocalUser RDP
+          $admins = Get-LocalGroup -SID 'S-1-5-32-544'
+          if (Get-LocalGroupMember -Group $admins.Name | Where-Object { $_.SID.Value -eq $user.SID.Value }) {
+            throw 'RDP user must not be an administrator.'
+          }
+          $rule = Get-NetFirewallRule -Name 'GH-RDP-Client'
+          $scope = $rule | Get-NetFirewallAddressFilter
+          if ($rule.Enabled -ne 'True' -or
+              @($scope.RemoteAddress).Count -ne 1 -or
+              $scope.RemoteAddress[0] -ne $env:CLIENT_IP -or
+              $scope.LocalAddress[0] -ne $env:TAILSCALE_IP) {
+            throw 'Unexpected RDP firewall scope.'
+          }
+          $ready = $false
+          for ($i = 0; $i -lt 12; $i++) {
+            if (Get-NetTCPConnection -State Listen -LocalPort 3389 -ErrorAction SilentlyContinue) {
+              $ready = $true
+              break
+            }
+            Start-Sleep -Seconds 5
+          }
+          if (-not $ready) { throw 'RDP listener did not start.' }
+          @"
+          ## Temporary RDP session
+          - Address: $env:TAILSCALE_IP`:3389
+          - Username: .\RDP
+          - Password: the value you set in RDP_PASSWORD (not printed).
+          - Allowed client: $env:CLIENT_IP
+          - Requested duration: $env:SESSION_MINUTES minutes
+          - Stop early with Cancel workflow in GitHub Actions.
+          - Local checks passed; connect from your client to verify ACLs and login.
+          - Runner data is temporary. Save required work before the session ends.
+          "@ | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-      - name: Maintain Connection
+      - name: Bounded session with health monitoring
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: Rdp@12345"
-          Write-Host "==================`n"
-          while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
+          $ErrorActionPreference = 'Stop'
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $deadline = [DateTime]::UtcNow.AddMinutes([int]$env:SESSION_MINUTES)
+          $failures = 0
+          while ([DateTime]::UtcNow -lt $deadline) {
+            try {
+              $raw = & $ts status --json
+              if ($LASTEXITCODE -ne 0) { throw 'Tailscale status failed.' }
+              $status = ($raw -join "`n") | ConvertFrom-Json
+              if ($status.BackendState -ne 'Running' -or -not $status.Self.Online -or
+                  (Get-Service TermService).Status -ne 'Running' -or
+                  -not (Get-NetTCPConnection -State Listen -LocalPort 3389 -ErrorAction SilentlyContinue)) {
+                throw 'Tailscale or RDP is unhealthy.'
+              }
+              $failures = 0
+            } catch {
+              $failures++
+              Write-Warning "Health check failed ($failures/3)."
+              if ($failures -ge 3) { throw 'Repeated health failures; ending session.' }
+            }
+            $remaining = [Math]::Max(0, [Math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalMinutes))
+            Write-Host "Session window open; about $remaining minute(s) left. This does not confirm an active RDP login."
+            $seconds = [Math]::Min(60, [Math]::Max(1, [int]($deadline - [DateTime]::UtcNow).TotalSeconds))
+            Start-Sleep -Seconds $seconds
           }
+
+      - name: Best-effort session cleanup
+        if: ${{ always() }}
+        timeout-minutes: 3
+        run: |
+          $ErrorActionPreference = 'Continue'
+          if ($env:RDP_CONFIG_STARTED -eq 'true') {
+            Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 1
+            Get-NetFirewallRule -Name 'GH-RDP-Client' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+            Stop-Service TermService -Force -ErrorAction Continue
+          }
+          if ($env:RDP_USER_CREATED -eq 'true') {
+            Disable-LocalUser RDP -ErrorAction Continue
+            Remove-LocalUser RDP -ErrorAction Continue
+          }
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (Test-Path $ts) {
+            & $ts logout
+            if ($LASTEXITCODE -ne 0) { Write-Warning 'Tailscale logout failed; review the device in the admin console.' }
+          }
+          Write-Host 'Cleanup attempted. Forced termination may prevent cleanup; ephemeral keys remain important.'
