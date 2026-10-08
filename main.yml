@@ -1,113 +1,307 @@
+# language: YAML, file: .github/workflows/main.yml, target: GitHub Actions windows-latest
+# Master workflow — 10 features + self-destruct cleanup
 name: RDP
 
 on:
   workflow_dispatch:
+    inputs:
+      hostname:
+        description: 'Tailscale hostname (default: gh-runner-<run_id>)'
+        required: false
+        type: string
+      password:
+        description: 'RDP password (default: Rdp@12345)'
+        required: false
+        default: 'Rdp@12345'
+        type: string
+      exit_node:
+        description: 'Advertise as Tailscale exit node (needs admin approval)'
+        required: false
+        default: false
+        type: boolean
+      install_tools:
+        description: 'Comma-separated Chocolatey packages (e.g., 7zip,git,python)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rdp-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    timeout-minutes: 360
 
     steps:
       - name: Configure Core RDP Settings
+        shell: pwsh
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                              -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
+                             -Name "SecurityLayer" -Value 1 -Force
+          Get-NetFirewallRule -DisplayName "RDP-Tailscale" -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName "RDP-Tailscale" `
+            -Direction Inbound -Action Allow -Protocol TCP `
+            -LocalPort 3389 -RemoteAddress 100.64.0.0/10 -Profile Any
 
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          
-          # For testing, allow any incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
-
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
-          Restart-Service -Name TermService -Force
-
-      - name: Create RDP User with Secure Password
-        run: |
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126)) # Special characters
+          $ok = $false
+          for ($i = 0; $i -lt 3 -and -not $ok; $i++) {
+              try {
+                  Restart-Service -Name TermService -Force -ErrorAction Stop
+                  $ok = $true
+              } catch {
+                  Write-Host "TermService restart attempt $($i+1) failed: $_"
+                  Start-Sleep -Seconds 5
+              }
           }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          if (-not $ok) { Write-Error "TermService restart failed"; exit 1 }
+          Start-Sleep -Seconds 5
+
+      - name: Create RDP User
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ inputs.password }}
+        run: |
+          $password = if ($env:RDP_PASSWORD) { $env:RDP_PASSWORD } else { "Rdp@12345" }
+
+          $secCfg = "$env:TEMP\secpol.cfg"
+          $secDb  = "$env:TEMP\secedit.sdb"
+          secedit /export /cfg "$secCfg"
+          (Get-Content $secCfg) `
+              -replace 'PasswordComplexity = 1', 'PasswordComplexity = 0' `
+              -replace 'MinimumPasswordLength = \d+', 'MinimumPasswordLength = 0' `
+              | Set-Content $secCfg -Encoding Unicode
+          secedit /configure /db "$secDb" /cfg "$secCfg" /areas SECURITYPOLICY
+          Remove-Item $secCfg -Force -ErrorAction SilentlyContinue
+          Remove-Item $secDb  -Force -ErrorAction SilentlyContinue
+
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-          
-          if (-not (Get-LocalUser -Name "RDP")) {
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "RDP" -Password $securePass `
+                  -AccountNeverExpires -PasswordNeverExpires -ErrorAction Stop
+          } else {
+              Set-LocalUser    -Name "RDP" -Password $securePass -ErrorAction Stop
+              Set-LocalUser    -Name "RDP" -PasswordNeverExpires $true -ErrorAction SilentlyContinue
+          }
+          Add-LocalGroupMember -Group "Administrators"       -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
               Write-Error "User creation failed"
               exit 1
           }
 
       - name: Install Tailscale
+        shell: pwsh
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-          
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
       - name: Establish Tailscale Connection
+        shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          TS_HOSTNAME_INPUT: ${{ inputs.hostname }}
+          TS_EXIT_NODE: ${{ inputs.exit_node }}
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          
-          # Wait for Tailscale to assign an IP
+          $hostname = if ($env:TS_HOSTNAME_INPUT) { $env:TS_HOSTNAME_INPUT } else { "gh-runner-$env:GITHUB_RUN_ID" }
+          $tsArgs = @(
+              "up",
+              "--hostname=$hostname",
+              "--ephemeral",
+              "--accept-dns=false"
+          )
+          if ($env:TS_EXIT_NODE -eq "true") { $tsArgs += "--advertise-exit-node" }
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" @tsArgs
+
           $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
+          for ($i = 0; $i -lt 12 -and -not $tsIP; $i++) {
+              $raw = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null | Select-Object -First 1
+              if ($raw) { $tsIP = $raw.Trim() }
+              if (-not $tsIP) { Start-Sleep -Seconds 5 }
           }
-          
           if (-not $tsIP) {
               Write-Error "Tailscale IP not assigned. Exiting."
               exit 1
           }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-      
+          "TAILSCALE_IP=$tsIP"    | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TS_HOSTNAME=$hostname" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Configure RDP Session
+        shell: pwsh
+        run: |
+          $rdpKey = 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+          Set-ItemProperty -Path $rdpKey -Name "MaxIdleTime"          -Value 0 -Force
+          Set-ItemProperty -Path $rdpKey -Name "MaxDisconnectionTime" -Value 0 -Force
+          Set-ItemProperty -Path $rdpKey -Name "fDisableClip"         -Value 0 -Force
+          Set-ItemProperty -Path $rdpKey -Name "fDisableCdm"          -Value 0 -Force
+          Set-ItemProperty -Path $rdpKey -Name "fDisableCcm"          -Value 0 -Force
+          Set-ItemProperty -Path $rdpKey -Name "fDisableLPT"          -Value 0 -Force
+          Set-ItemProperty -Path $rdpKey -Name "fDisablePNPRedir"     -Value 0 -Force
+          Set-ItemProperty -Path $rdpKey -Name "fDisableAudioCapture" -Value 0 -Force
+          try { Restart-Service -Name TermService -Force -ErrorAction Stop } catch { Write-Host "TermService restart: $_" }
+          Start-Sleep -Seconds 3
+
+      - name: Install Tools
+        if: inputs.install_tools != ''
+        shell: pwsh
+        run: |
+          $tools = "${{ inputs.install_tools }}" -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+          foreach ($tool in $tools) {
+              Write-Host "Installing $tool..."
+              choco install $tool -y --no-progress
+          }
+
       - name: Verify RDP Accessibility
+        shell: pwsh
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
+          $ok = $false
+          for ($i = 0; $i -lt 5 -and -not $ok; $i++) {
+              $r = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+              if ($r.TcpTestSucceeded) { $ok = $true } else { Start-Sleep -Seconds 5 }
           }
+          if (-not $ok) { Write-Error "TCP connection to RDP port 3389 failed"; exit 1 }
           Write-Host "TCP connectivity successful!"
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" status
+
+      - name: Connection Info
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ inputs.password }}
+        run: |
+          $password = if ($env:RDP_PASSWORD) { $env:RDP_PASSWORD } else { "Rdp@12345" }
+          $summary = @"
+## RDP Connection Info
+
+- **Tailscale IP:** $env:TAILSCALE_IP
+- **Hostname:** $env:TS_HOSTNAME
+- **Username:** RDP
+- **Password:** $password
+- **Port:** 3389
+- **Security:** NLA off, SecurityLayer=Negotiate (TLS when client supports)
+
+"@
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" status | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
 
       - name: Maintain Connection
+        shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          RDP_PASSWORD: ${{ inputs.password }}
+          TS_EXIT_NODE: ${{ inputs.exit_node }}
         run: |
+          $password = if ($env:RDP_PASSWORD) { $env:RDP_PASSWORD } else { "Rdp@12345" }
           Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Address:  $env:TAILSCALE_IP"
+          Write-Host "Hostname: $env:TS_HOSTNAME"
           Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "Password: $password"
           Write-Host "==================`n"
-          
-          # Keep runner active indefinitely (or until manually cancelled)
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              $null = & "$env:ProgramFiles\Tailscale\tailscale.exe" status 2>$null
+              if ($LASTEXITCODE -ne 0) {
+                  Write-Host "[$(Get-Date)] Tailscale down, reconnecting..."
+                  $tsArgs = @(
+                      "up",
+                      "--hostname=$env:TS_HOSTNAME",
+                      "--ephemeral",
+                      "--accept-dns=false"
+                  )
+                  if ($env:TS_EXIT_NODE -eq "true") { $tsArgs += "--advertise-exit-node" }
+                  & "$env:ProgramFiles\Tailscale\tailscale.exe" @tsArgs 2>$null
+              }
+              Write-Host "[$(Get-Date)] RDP Active - IP: $env:TAILSCALE_IP - Cancel workflow to terminate"
               Start-Sleep -Seconds 300
           }
+
+      - name: Self-Destruct Cleanup
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Write-Host "=== SELF-DESTRUCT SEQUENCE START ==="
+
+          try {
+              (query user) 2>$null | Select-Object -Skip 1 | ForEach-Object {
+                  if ($_ -match '^\s*(\S+)\s+') {
+                      $u = $matches[1]
+                      if ($u -and $u -ne 'USERNAME') { logoff $u 2>$null }
+                  }
+              }
+          } catch {}
+
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (Test-Path $ts) {
+              & $ts logout 2>$null
+              & $ts down   2>$null
+              Start-Sleep -Seconds 2
+          }
+
+          Stop-Service -Name Tailscale -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 2
+
+          Remove-Item "$env:ProgramData\Tailscale"  -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "$env:LOCALAPPDATA\Tailscale" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "$env:ProgramFiles\Tailscale" -Recurse -Force -ErrorAction SilentlyContinue
+
+          Remove-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+          Remove-Item "C:\Users\RDP"   -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "C:\Users\RDP.*" -Recurse -Force -ErrorAction SilentlyContinue
+
+          Get-NetFirewallRule -DisplayName "RDP-Tailscale" -ErrorAction SilentlyContinue |
+              Remove-NetFirewallRule -ErrorAction SilentlyContinue
+
+          Get-Process -Name "mstsc","rdpclip","rdpservice","tscon" -ErrorAction SilentlyContinue |
+              Stop-Process -Force -ErrorAction SilentlyContinue
+
+          Remove-Item "$env:APPDATA\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt" -Force -ErrorAction SilentlyContinue
+          Remove-Item "$env:APPDATA\Microsoft\PowerShell\PSReadLine\ConsoleHost_history.txt"          -Force -ErrorAction SilentlyContinue
+          Remove-Item "$env:USERPROFILE\Documents\PowerShell\PSReadLine\ConsoleHost_history.txt"      -Force -ErrorAction SilentlyContinue
+
+          $logs = @(
+              "Security",
+              "System",
+              "Application",
+              "Windows PowerShell",
+              "Microsoft-Windows-PowerShell/Operational",
+              "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational",
+              "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational"
+          )
+          foreach ($log in $logs) { wevtutil cl "$log" 2>$null }
+
+          Get-WinEvent -ListLog *RDP* -ErrorAction SilentlyContinue | ForEach-Object {
+              wevtutil cl $_.LogName 2>$null
+          }
+          Get-WinEvent -ListLog *TerminalServices* -ErrorAction SilentlyContinue | ForEach-Object {
+              wevtutil cl $_.LogName 2>$null
+          }
+
+          Remove-Item "$env:TEMP\*"       -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "C:\Windows\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
+
+          Remove-Item "C:\Windows\Prefetch\*" -Recurse -Force -ErrorAction SilentlyContinue
+
+          cmdkey /list 2>$null | Select-String "Target:" | ForEach-Object {
+              $t = ($_ -replace '.*Target:\s*','').Trim()
+              if ($t) { cmdkey /delete:$t 2>$null }
+          }
+
+          Remove-Item "HKCU:\Software\Microsoft\Terminal Server Client\Default" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "HKCU:\Software\Microsoft\Terminal Server Client\Servers" -Recurse -Force -ErrorAction SilentlyContinue
+
+          ipconfig /flushdns 2>$null
+          arp -d * 2>$null
+
+          Write-Host "=== SELF-DESTRUCT SEQUENCE COMPLETE ==="
