@@ -114,18 +114,79 @@ jobs:
           TS_EXIT_NODE: ${{ inputs.exit_node }}
         run: |
           $hostname = if ($env:TS_HOSTNAME_INPUT) { $env:TS_HOSTNAME_INPUT } else { "gh-runner-$env:GITHUB_RUN_ID" }
-          $tsArgs = @(
-              "up",
-              "--hostname=$hostname",
-              "--ephemeral",
-              "--accept-dns=false"
-          )
-          if ($env:TS_EXIT_NODE -eq "true") { $tsArgs += "--advertise-exit-node" }
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" @tsArgs
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
+          $tsArgs = @("up", "--hostname=$hostname", "--ephemeral", "--accept-dns=false")
+          if ($env:TS_EXIT_NODE -eq "true") { $tsArgs += "--advertise-exit-node" }
+
+          if ($env:TS_AUTHKEY) {
+              Write-Host "Auth key present — non-interactive login."
+              & $ts @tsArgs
+          } else {
+              Write-Host "No auth key — starting interactive browser login flow."
+              $job = Start-Job -ScriptBlock {
+                  $exe = $using:ts
+                  $a   = $using:tsArgs
+                  & $exe @a
+              }
+
+              # Poll job output for the auth URL
+              $authUrl = $null
+              for ($i = 0; $i -lt 30 -and -not $authUrl; $i++) {
+                  Start-Sleep -Seconds 2
+                  $out = Receive-Job $job -Keep 2>&1 | Out-String
+                  if ($out -match '(https://login\.tailscale\.com/\S+)') {
+                      $authUrl = $matches[1].Trim()
+                  }
+              }
+
+          if ($authUrl) {
+              Write-Host ""
+              Write-Host "===================================================="
+              Write-Host "OPEN THIS URL IN YOUR BROWSER TO AUTHENTICATE:"
+              Write-Host "  $authUrl"
+              Write-Host "===================================================="
+              Write-Host ""
+              $lines = @(
+                '## 🔐 Tailscale Login Required',
+                '',
+                'Open this URL in your browser, log in with your Tailscale account, and approve the device:',
+                '',
+                ('**[' + $authUrl + '](' + $authUrl + ')**'),
+                '',
+                ('Device name: `' + $hostname + '`'),
+                '',
+                '_This step waits up to 10 minutes for you to authenticate._'
+              )
+              $lines -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          } else {
+              Write-Warning "Could not capture auth URL. Check job output below."
+          }
+
+              # Wait for tailscale up job to finish (= authentication complete)
+              $waited = 0
+              while ($job.State -eq 'Running' -and $waited -lt 600) {
+                  Start-Sleep -Seconds 5
+                  $waited += 5
+                  if ($waited % 30 -eq 0) {
+                      Write-Host "[$(Get-Date)] Waiting for browser auth... ($waited s)"
+                  }
+              }
+              if ($job.State -eq 'Running') {
+                  Stop-Job $job -ErrorAction SilentlyContinue
+                  Remove-Job $job -Force -ErrorAction SilentlyContinue
+                  Write-Error "Tailscale auth timed out after 10 minutes."
+                  exit 1
+              }
+              Write-Host "--- tailscale up output ---"
+              Receive-Job $job 2>&1 | Write-Host
+              Remove-Job $job -Force -ErrorAction SilentlyContinue
+          }
+
+          # Confirm IP assignment
           $tsIP = $null
           for ($i = 0; $i -lt 12 -and -not $tsIP; $i++) {
-              $raw = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null | Select-Object -First 1
+              $raw = & $ts ip -4 2>$null | Select-Object -First 1
               if ($raw) { $tsIP = $raw.Trim() }
               if (-not $tsIP) { Start-Sleep -Seconds 5 }
           }
