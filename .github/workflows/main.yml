@@ -1,4 +1,4 @@
-# language: YAML, file: .github/workflows/rdp.yml, target: GitHub Actions windows-latest
+# language: YAML, file: .github/workflows/main.yml, target: GitHub Actions windows-latest
 # Master workflow — 10 features + self-destruct cleanup
 name: RDP
 
@@ -51,7 +51,6 @@ jobs:
             -Direction Inbound -Action Allow -Protocol TCP `
             -LocalPort 3389 -RemoteAddress 100.64.0.0/10 -Profile Any
 
-          # retry: TermService restart can fail transiently, dependents flaky
           $ok = $false
           for ($i = 0; $i -lt 3 -and -not $ok; $i++) {
               try {
@@ -116,7 +115,6 @@ jobs:
           TS_EXIT_NODE: ${{ inputs.exit_node }}
         run: |
           $hostname = if ($env:TS_HOSTNAME_INPUT) { $env:TS_HOSTNAME_INPUT } else { "gh-runner-$env:GITHUB_RUN_ID" }
-          # TS_AUTHKEY env var is read automatically by tailscale CLI
           $tsArgs = @(
               "up",
               "--hostname=$hostname",
@@ -235,7 +233,6 @@ jobs:
         run: |
           Write-Host "=== SELF-DESTRUCT SEQUENCE START ==="
 
-          # 1. Kill active RDP sessions (skip header row)
           try {
               (query user) 2>$null | Select-Object -Skip 1 | ForEach-Object {
                   if ($_ -match '^\s*(\S+)\s+') {
@@ -245,7 +242,6 @@ jobs:
               }
           } catch {}
 
-          # 2. Tailscale logout + down
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
           if (Test-Path $ts) {
               & $ts logout 2>$null
@@ -253,34 +249,27 @@ jobs:
               Start-Sleep -Seconds 2
           }
 
-          # 3. Stop Tailscale service so files unlock
           Stop-Service -Name Tailscale -Force -ErrorAction SilentlyContinue
           Start-Sleep -Seconds 2
 
-          # 4. Wipe Tailscale state + install
           Remove-Item "$env:ProgramData\Tailscale"  -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item "$env:LOCALAPPDATA\Tailscale" -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item "$env:ProgramFiles\Tailscale" -Recurse -Force -ErrorAction SilentlyContinue
 
-          # 5. Remove RDP user + profile dirs
           Remove-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
           Remove-Item "C:\Users\RDP"   -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item "C:\Users\RDP.*" -Recurse -Force -ErrorAction SilentlyContinue
 
-          # 6. Firewall rule
           Get-NetFirewallRule -DisplayName "RDP-Tailscale" -ErrorAction SilentlyContinue |
               Remove-NetFirewallRule -ErrorAction SilentlyContinue
 
-          # 7. Kill RDP-related processes
           Get-Process -Name "mstsc","rdpclip","rdpservice","tscon" -ErrorAction SilentlyContinue |
               Stop-Process -Force -ErrorAction SilentlyContinue
 
-          # 8. Wipe PowerShell history (PS 5.1 + PS 7 + Documents)
           Remove-Item "$env:APPDATA\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt" -Force -ErrorAction SilentlyContinue
           Remove-Item "$env:APPDATA\Microsoft\PowerShell\PSReadLine\ConsoleHost_history.txt"          -Force -ErrorAction SilentlyContinue
           Remove-Item "$env:USERPROFILE\Documents\PowerShell\PSReadLine\ConsoleHost_history.txt"      -Force -ErrorAction SilentlyContinue
 
-          # 9. Clear event logs
           $logs = @(
               "Security",
               "System",
@@ -292,7 +281,6 @@ jobs:
           )
           foreach ($log in $logs) { wevtutil cl "$log" 2>$null }
 
-          # 10. Wipe lingering RDP/TerminalServices logs
           Get-WinEvent -ListLog *RDP* -ErrorAction SilentlyContinue | ForEach-Object {
               wevtutil cl $_.LogName 2>$null
           }
@@ -300,29 +288,20 @@ jobs:
               wevtutil cl $_.LogName 2>$null
           }
 
-          # 11. Wipe temp dirs
           Remove-Item "$env:TEMP\*"       -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item "C:\Windows\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
 
-          # 12. Clear prefetch
           Remove-Item "C:\Windows\Prefetch\*" -Recurse -Force -ErrorAction SilentlyContinue
 
-          # 13. Clear Credential Manager
           cmdkey /list 2>$null | Select-String "Target:" | ForEach-Object {
               $t = ($_ -replace '.*Target:\s*','').Trim()
               if ($t) { cmdkey /delete:$t 2>$null }
           }
 
-          # 14. Clear RDP client registry traces
           Remove-Item "HKCU:\Software\Microsoft\Terminal Server Client\Default" -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item "HKCU:\Software\Microsoft\Terminal Server Client\Servers" -Recurse -Force -ErrorAction SilentlyContinue
 
-          # 15. Flush DNS + ARP cache
           ipconfig /flushdns 2>$null
           arp -d * 2>$null
-
-          # cipher /w:C:\ removed — takes 20-40min, VM is destroyed by GitHub anyway.
-          # If you really want it, uncomment and accept cleanup may be truncated:
-          # try { cipher /w:C:\ 2>$null } catch {}
 
           Write-Host "=== SELF-DESTRUCT SEQUENCE COMPLETE ==="
